@@ -234,6 +234,74 @@ module SalesforceBulk
       end
     end
 
+    def streaming_http_get_with_retry(path, headers, &block)
+      last_exception = nil
+      3.times do |attempt|
+        begin
+          return streaming_http_get(path, headers, &block)
+        rescue => ex
+          last_exception = ex
+          # Utils.scalyr('Salesforce', 'ClientQueryFail', message: ex.message, path: path, attempt: attempt)
+        end
+      end
+      raise last_exception
+    end
+
+    def streaming_http_get(path, headers={})
+      path = "#{@api_path_prefix}#{path}"
+
+      headers = {'Content-Type' => 'application/xml'}.merge(headers)
+
+      if @session_id
+        headers['X-SFDC-Session'] = @session_id
+      end
+
+      Net::HTTP.start(self.instance_host, 443,
+        :use_ssl => true,
+        :verify_mode => OpenSSL::SSL::VERIFY_NONE) do |http|
+        request = Net::HTTP::Get.new(path, headers)
+        http.request request do |response|
+          if response.is_a?(Net::HTTPSuccess)
+            yield response
+          else
+            raise SalesforceError.new(response)
+          end
+        end
+      end
+      nil
+    end
+
+    def streaming_batch_result(jobId, batchId)
+      response = http_get("job/#{jobId}/batch/#{batchId}/result")
+      if ['application/xml', 'text/xml'].include? response.content_type
+        result = XmlSimple.xml_in(response.body)
+
+        if result['result'].present?
+          result['result'].each do |resultId|
+            streaming_query_result(jobId, batchId, resultId) do |batchResponse|
+              yield resultId, batchResponse
+            end
+          end
+        end
+        result['result']
+      else
+        result = BatchResultCollection.new(jobId, batchId)
+
+        CSV.parse(response.body, :headers => true) do |row|
+          result << BatchResult.new(row[0], row[1].to_b, row[2].to_b, row[3])
+        end
+
+        result
+      end
+    end
+
+    def streaming_query_result(job_id, batch_id, result_id)
+      headers = { 'Content-Type' => 'text/csv; charset=UTF-8' }
+      streaming_http_get_with_retry("job/#{job_id}/batch/#{batch_id}/result/#{result_id}", headers) do | response |
+        yield response
+      end
+    end
+
     def https_request(host)
       req = Net::HTTP.new(host, 443)
       req.use_ssl = true
